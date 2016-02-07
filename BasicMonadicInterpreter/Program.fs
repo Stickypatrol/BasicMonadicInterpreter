@@ -1,4 +1,6 @@
 ﻿//TYPES
+//anna christine speckhart
+
 type Parens =
   | Opening
   | Closing
@@ -42,99 +44,98 @@ and Expression =
     static member Wrap (t, pm, ex) =
       Multiple(t, pm, ex)
 
-//type ProgramState = List<char> * 
+//state definition
+type State =
+  {
+    Text : list<char>
+    Tree : Option<Expression>
+  }
 
-//actual monads
+//actual monads - idea, make a monad that keeps a collection of computations that you can print at any yield
+type PauseType =
+  | LexerPause
+  | ParserPause
+  | FinishPause
 
-type State<'a, 's> = 's -> Result<'a,'s>
-and Result<'a, 's> =
-  | Done of Maybe<'a> * 's
-  | Yield of State<'a, 's> * 's
-and Maybe<'a> =
-  | Success of 'a
-  | Error
+type StateCoroutine<'a, 's> = 's -> MaybeStep<'a, 's>
+and MaybeStep<'a, 's> =
+  | Done of 'a*'s
+  | Pause of PauseType*StateCoroutine<'a, 's> * 's
+  | Error of List<string>*'s
 
-let rec bind (p:State<'a, 's>) (k:'a -> State<'b, 's>) : State<'b, 's> =
-  fun s ->
-    match p s with
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(a, s') -> k a s'
-    | Yield(p', s') -> Yield(bind p' k, s')
-
-let ret x = fun s -> Done(Success(x, s))        
-
-let (>>=) = bind
-
-type StateBuilder() =
-  member this.Return(x) = ret x
-  member this.ReturnFrom (s:State<'a, 's>) = s
-  member this.Bind(p,k) = p >>= k
-let st = StateBuilder()
+//monad implementation
+and CoroutineBuilder() =
+  member this.Return(x) = fun s -> Done(x, s)
+  member this.ReturnFrom(s:StateCoroutine<'a, 's>) = s
+  member this.Bind(p:StateCoroutine<'a, 's>,k:'a -> StateCoroutine<'b, 's>) : StateCoroutine<'b, 's> =
+    fun s ->
+      match p s with
+      | Done(a, s') -> k a s' //continue with next monadic operation
+      | Pause(pt, p', s') -> Pause(pt, this.Bind(p', k), s') //pause until you are provided with another state
+      | Error(errormsg, s) -> Error(errormsg, s) //propagate the error
+let co = CoroutineBuilder()
 
 //monadic operators------------------------------------------------------------------
 
-let yield_ = fun s -> Yield((fun s -> Done(Success((), s))), s)
-
-let fail =
+let pause_ pt = fun s -> Pause(pt, (fun s -> Done((), s)), s)
+//time to start modifying these to fit the new monad definition
+let fail msg =
   fun s ->
-    Done(Error)
+    Error([msg], s)
 
 let getState =
   fun s ->
-    Done(Success(s, s))
+    Done(s, s)
 
 let setState x =
   fun s ->
-    Done(Success((), x))
+    Done((), x)
 
 let getHead =
-  fun s ->
-    match s with
-    | h::t -> Done(Success(h, t))
-    | [] -> Done(Error)
+  fun (s:State) ->
+    match s.Text with
+    | h::t -> Done(h, {s with Text = t})
+    | [] -> Error(["couldn't get ANY head"], s)
 
 let getEOF =
   fun s ->
     match s with
-    | [] -> Done(Success((), []))
-    | h::t -> Done(Error)
+    | [] -> Done((), s)
+    | h::t -> Error(["couldn't get EOF"], s)
 
-let (.||) (a:State<'a, 's>) (b:State<'a, 's>) =
+let rec (.||) (x:StateCoroutine<'a, 's>) (y:StateCoroutine<'a, 's>) =
   fun s ->
-    match a s with
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(res, s') -> Done(Success(res, s'))
-    | Yield(a', s') ->
-        match b s with
-        | Done(maybe) ->
-            match maybe with
-            | Error -> Done(Error)
-            | Success(res, s') -> Done(Success(res, s'))
-        | Yield(a', s') -> Yield(a', s')
+    match x s with
+    | Done(a, s') ->
+        Done(a, s')
+    | Error(errormsg1, s')->
+        match y s with
+        | Done(a, s') ->  //printfn "Result = %A" a
+                          Done(a, s')
+        | Error(errormsg2, s') -> Error(List.append errormsg1 errormsg2, s')
+        | Pause(pt, y', s') -> Pause(pt, y', s')
+    | Pause(pt, x', s') ->
+        Pause(pt, (.||) x' y, s')
 
 let rec repeated c =
-  st{
+  co{
     let! h = c
     let! t = repeated c
     return h::t
   } .||
-  st{
+  co{
     return []
   }
 
 let rec repeatedAtLeastOnce c =
-  st{
+  co{
     let! h = c
     let! t = repeated c
     return h::t
   }
 
-let Peek (f:State<'a, 's>) =
-  st{
+let Peek (f:StateCoroutine<'a, 's>) =
+  co{
     let! olds = getState
     let! res = f
     do! setState olds
@@ -143,38 +144,38 @@ let Peek (f:State<'a, 's>) =
 
 //monadic functions for parsing------------------------------------------------------------
 let Whitespace =
-  st{
+  co{
     let! h = getHead
     if h = ' ' || h = '\n' || h = '\r' || h = '\t' then
       return ()
     else
-      return! fail
+      return! fail "expected whitespace"
   }
 
 let SkipWhitespace =
-  st{
+  co{
     let! _ = repeated Whitespace
     return ()
   }
 
 let Numeral =
-  st{
+  co{
     let! h = getHead
     if h >= '0' && h <= '9' then
       return h
     else
-      return! fail
+      return! fail "expected numeral"
   }
 
 let ReadNumeral =
-  st{
+  co{
     do! SkipWhitespace
     let! result = repeatedAtLeastOnce Numeral
     return System.Double.Parse(List.fold(fun acc elem -> acc + (elem.ToString())) "" result)
   }
 
 let AddSub =
-  st{
+  co{
     do! SkipWhitespace
     let! h = getHead
     if h = '+' then
@@ -182,11 +183,11 @@ let AddSub =
     else if h = '-' then
       return Minus
     else
-      return! fail
+      return! fail "expected addition or subtraction"
   }
 
 let MultDivide =
-  st{
+  co{
     do! SkipWhitespace
     let! h = getHead
     if h = '*' then
@@ -194,11 +195,11 @@ let MultDivide =
     else if h = '/' then
       return Divide
     else
-      return! fail
+      return! fail "expected multiply or divide"
   }
 
 let Parens =
-  st{
+  co{
     do! SkipWhitespace
     let! h = getHead
     if h = '(' then
@@ -206,150 +207,122 @@ let Parens =
     else if h = ')' then
       return Closing
     else
-      return! fail
+      return! fail "expected parenthesis"
   }
 
-let PrintState x : State<Unit, 's> =
+let PrintState : StateCoroutine<Unit, 's> =
   fun s ->
-    do printfn "%A" x
     do printfn "%A" s
-    Done(Success((), s))
+    Done((), s)
 
 //monadic composition functions
 
-let rec FactorW1 (a:State<double, 's>) : State<Factor, 's> =
+let rec FactorW1 (x:StateCoroutine<double, 's>) : StateCoroutine<Factor, 's> =
   fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(FactorW1 a', s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(res, s') -> Done(Success(Factor.Wrap(res), s'))
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, FactorW1 x', s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') -> Done(Factor.Wrap(resx), s')
 
 
-let rec FactorW2 (a:State<PlusMinus, 's>) (b:State<Factor, 's>) =
+let rec FactorW2 (x:StateCoroutine<PlusMinus, 's>) (y:StateCoroutine<Factor, 's>) =
   fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(FactorW2 a' b, s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(resa, s') ->
-            match b s' with
-            | Yield(b', s'') -> Yield(FactorW2 (ret resa) b', s'')
-            | Done(maybe) ->
-                match maybe with
-                | Error -> Done(Error)
-                | Success(resb, s'') -> Done(Success(Factor.Wrap(resa, resb), s''))
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, FactorW2 x' y, s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') ->
+        match y s' with
+        | Pause(pt, y', s'') -> Pause(pt, FactorW2 (co{return resx}) y', s'')
+        | Error(errormsg, s') -> Error(errormsg, s')
+        | Done(resy, s'') -> Done(Factor.Wrap(resx, resy), s'')
 
-let rec FactorW3 a b c =
+let rec FactorW3 x y z =
   fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(FactorW3 a' b c, s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(resa, s') ->
-            match b s' with
-            | Yield(b', s'') -> Yield(FactorW3 (ret resa) b' c, s'')
-            | Done(maybe) ->
-                match maybe with
-                | Error -> Done(Error)
-                | Success(resb, s'') ->
-                    match c s'' with
-                    | Yield(c', s''') -> Yield(FactorW3 (ret resa) (ret resb) c', s''')
-                    | Done(maybe) ->
-                        match maybe with
-                        | Error -> Done(Error)
-                        | Success(resc, s''') -> Done(Success(Factor.Wrap(resa, resb, resc), s'''))
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, FactorW3 x' y z, s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') ->
+        match y s' with
+        | Pause(pt, y', s'') -> Pause(pt, FactorW3 (co{return resx}) y' z, s'')
+        | Error(errormsg, s'') -> Error(errormsg, s'')
+        | Done(resy, s'') -> 
+            match z s'' with
+            | Pause(pt, z', s''') -> Pause(pt, FactorW3 (co{return resx}) (co{return resy}) z', s''')
+            | Error(errormsg, s''') -> Error(errormsg, s''')
+            | Done(resz, s''') -> Done(Factor.Wrap(resx, resy, resz), s''')
 
-let rec TermW1 a =
+let rec TermW1 (x:StateCoroutine<Factor, 's>) : StateCoroutine<Term, 's> =
   fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(TermW1 a', s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(res, s') -> Done(Success(Term.Wrap(res), s'))
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, TermW1 x', s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') -> Done(Term.Wrap(resx), s')
 
-let rec TermW3 a b c =
+let rec TermW3 x y z =
   fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(TermW3 a' b c, s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(resa, s') ->
-            match b s' with
-            | Yield(b', s'') -> Yield(TermW3 (ret resa) b' c, s'')
-            | Done(maybe) ->
-                match maybe with
-                | Error -> Done(Error)
-                | Success(resb, s'') ->
-                    match c s'' with
-                    | Yield(c', s''') -> Yield(TermW3 (ret resa) (ret resb) c', s''')
-                    | Done(maybe) ->
-                        match maybe with
-                        | Error -> Done(Error)
-                        | Success(resc, s''') -> Done(Success(Term.Wrap(resa, resb, resc), s'''))
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, TermW3 x' y z, s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') ->
+        match y s' with
+        | Pause(pt, y', s'') -> Pause(pt, TermW3 (co{return resx}) y' z, s'')
+        | Error(errormsg, s'') -> Error(errormsg, s'')
+        | Done(resy, s'') -> 
+            match z s'' with
+            | Pause(pt, z', s''') -> Pause(pt, TermW3 (co{return resx}) (co{return resy}) z', s''')
+            | Error(errormsg, s''') -> Error(errormsg, s''')
+            | Done(resz, s''') -> Done(Term.Wrap(resx, resy, resz), s''')
 
-let rec ExprW1 a =
-  fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(ExprW1 a', s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(res, s') -> Done(Success(Expression.Wrap(res), s'))
 
-let rec ExprW3 a b c =
+let rec ExprW1 (x:StateCoroutine<Term, 's>) : StateCoroutine<Expression, 's> =
   fun s ->
-    match a s with
-    | Yield(a', s') -> Yield(ExprW3 a' b c, s')
-    | Done(maybe) ->
-        match maybe with
-        | Error -> Done(Error)
-        | Success(resa, s') ->
-            match b s' with
-            | Yield(b', s'') -> Yield(ExprW3 (ret resa) b' c, s'')
-            | Done(maybe) ->
-                match maybe with
-                | Error -> Done(Error)
-                | Success(resb, s'') ->
-                    match c s'' with
-                    | Yield(c', s''') -> Yield(ExprW3 (ret resa) (ret resb) c', s''')
-                    | Done(maybe) ->
-                        match maybe with
-                        | Error -> Done(Error)
-                        | Success(resc, s''') -> Done(Success(Expression.Wrap(resa, resb, resc), s'''))
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, ExprW1 x', s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') -> Done(Expression.Wrap(resx), s')
+
+let rec ExprW3 x y z =
+  fun s ->
+    match x s with
+    | Pause(pt, x', s') -> Pause(pt, ExprW3 x' y z, s')
+    | Error(errormsg, s') -> Error(errormsg, s')
+    | Done(resx, s') ->
+        match y s' with
+        | Pause(pt, y', s'') -> Pause(pt, ExprW3 (co{return resx}) y' z, s'')
+        | Error(errormsg, s'') -> Error(errormsg, s'')
+        | Done(resy, s'') -> 
+            match z s'' with
+            | Pause(pt, z', s''') -> Pause(pt, ExprW3 (co{return resx}) (co{return resy}) z', s''')
+            | Error(errormsg, s''') -> Error(errormsg, s''')
+            | Done(resz, s''') -> Done(Expression.Wrap(resx, resy, resz), s''')
 
 //PARSER
 
 let rec FactorParser() =
-  st{
+  co{
     do! SkipWhitespace
+    do! pause_ ParserPause
     let! factor = (FactorW3 Parens (ExprParser()) Parens) .||
                   (FactorW2 AddSub (FactorParser())) .||
                   FactorW1 ReadNumeral
-    do! PrintState factor
     return factor
   }
 
 and TermParser() =
-  st{
+  co{
     do! SkipWhitespace
+    do! pause_ ParserPause
     let! term = (TermW3 (FactorParser()) MultDivide (TermParser())) .||
                 (TermW1 (FactorParser()))
-    do! PrintState term
     return term
   }
 
 and ExprParser() =
-  st{
+  co{
     do! SkipWhitespace
+    do! pause_ ParserPause
     let! expr = (ExprW3 (TermParser()) AddSub (ExprParser())) .||
                 (ExprW1 (TermParser()))
-    do! PrintState expr
     do! SkipWhitespace
     return expr
   }
@@ -385,36 +358,32 @@ and ExprEval expr =
       | Minus -> (TermEval term) % 1000000007.0 - (ExprEval expr')
   | End -> 0.0
 
-let rec PrettyPrinter() = 
-  st{
-    let! p' = ExprParser()
-    return p'
-  }
-
-let costep c =
+let rec costep (c:StateCoroutine<Expression, State>) (pauses:List<PauseType>) =
   fun s ->
     match c s with
-    | Yield(c', s') -> (fun s -> c' s), s'
-    | Done(maybe) ->
-        match maybe with
-        | Error -> (fun s -> Done(Error)), s
-        | Success(res, s') -> (fun s -> Done(Success(res, s))), s'
+    | Done(a, s') -> (fun s -> Done(a, s)), s'
+    | Error(errormsg, s') -> (fun s -> Done(End, s)), s'
+    | Pause(pt, c', s') ->
+        if List.exists(fun listpt -> listpt = pt) pauses then
+          (fun s -> c' s), s'
+        else
+          costep c' pauses s'
 
 //actual program
 let Explode xs =
   [for x in xs do yield x]
 
-let rec Program c s =
-  let c', s' = costep c s
-  match s' with
-  | h::t -> Program c' s'
+let rec Program (c:StateCoroutine<Expression, State>) (s:State) pauses =
+  let c', s' = costep c pauses s
+  match s'.Text with
+  | h::t -> printfn "Head:'%A' Tail:'%A'" h t
+            System.Console.ReadLine()
+            Program c' s' pauses
   | [] -> printfn "Finished parsing, now to evaluate"
           c'
-  
-  //let evaluated = ExprEval parsestep
-  //printfn "%A" (int <| (evaluated %? 1000000007.0))
 
+let pauses = [LexerPause;ParserPause] //which kinds of pauses(or yields) to actually pause the entire coroutine at
 do ignore <| System.Console.WindowWidth <- 180
 do ignore <| System.Console.WindowHeight <- 56
-let input = Explode (System.Console.ReadLine())
-let finalexpr = Program (ExprParser()) input
+let input = {Text = Explode (System.Console.ReadLine()); Tree = None}
+let finalexpr = Program (ExprParser()) input pauses
