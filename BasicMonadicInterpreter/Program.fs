@@ -15,40 +15,40 @@ and MultiDivide =
 
 and Factor =
   | Number of double
-  | Compound of PlusMinus * Factor
-  | Parenthesized of Parens*Expression*Parens
+  | CompoundFactor of PlusMinus * Factor
+  | ParenthesizedExpr of Parens*Expression*Parens
   with
     static member Wrap fl =
       Number(fl)
     static member Wrap (pm, f) =
-      Compound(pm, f)
+      CompoundFactor(pm, f)
     static member Wrap (pa, ex, pb) =
-      Parenthesized(pa, ex, pb)
+      ParenthesizedExpr(pa, ex, pb)
 
 and Term =
-  | SingleT of Factor
-  | MultipleT of Factor * MultiDivide * Term
+  | SingleTerm of Factor
+  | MultipleTerm of Factor * MultiDivide * Term
   with
     static member Wrap fa =
-      SingleT fa
+      SingleTerm fa
     static member Wrap (f, md, t) =
-      MultipleT(f, md, t)
+      MultipleTerm(f, md, t)
 
 and Expression =
-  | Single of Term
-  | Multiple of Term * PlusMinus * Expression
+  | SingleExpr of Term
+  | CompoundExpr of Term * PlusMinus * Expression
   | End
   with
     static member Wrap t =
-      Single t
+      SingleExpr t
     static member Wrap (t, pm, ex) =
-      Multiple(t, pm, ex)
+      CompoundExpr(t, pm, ex)
 
 //state definition
 type State =
   {
     Text : list<char>
-    Tree : Option<Expression>
+    Tree : Expression
   }
 
 //actual monads - idea, make a monad that keeps a collection of computations that you can print at any yield
@@ -110,8 +110,7 @@ let rec (.||) (x:StateCoroutine<'a, 's>) (y:StateCoroutine<'a, 's>) =
         Done(a, s')
     | Error(errormsg1, s')->
         match y s with
-        | Done(a, s') ->  //printfn "Result = %A" a
-                          Done(a, s')
+        | Done(a, s') -> Done(a, s')
         | Error(errormsg2, s') -> Error(List.append errormsg1 errormsg2, s')
         | Pause(pt, y', s') -> Pause(pt, y', s')
     | Pause(pt, x', s') ->
@@ -215,6 +214,10 @@ let PrintState : StateCoroutine<Unit, 's> =
     do printfn "%A" s
     Done((), s)
 
+let PrintResult x : StateCoroutine<Unit, 's> =
+  fun s ->
+    do printfn "\nParseresult:\n\n%A" x
+    Done((), s)
 //monadic composition functions
 
 let rec FactorW1 (x:StateCoroutine<double, 's>) : StateCoroutine<Factor, 's> =
@@ -267,7 +270,7 @@ let rec TermW3 x y z =
         match y s' with
         | Pause(pt, y', s'') -> Pause(pt, TermW3 (co{return resx}) y' z, s'')
         | Error(errormsg, s'') -> Error(errormsg, s'')
-        | Done(resy, s'') -> 
+        | Done(resy, s'') ->
             match z s'' with
             | Pause(pt, z', s''') -> Pause(pt, TermW3 (co{return resx}) (co{return resy}) z', s''')
             | Error(errormsg, s''') -> Error(errormsg, s''')
@@ -279,7 +282,8 @@ let rec ExprW1 (x:StateCoroutine<Term, 's>) : StateCoroutine<Expression, 's> =
     match x s with
     | Pause(pt, x', s') -> Pause(pt, ExprW1 x', s')
     | Error(errormsg, s') -> Error(errormsg, s')
-    | Done(resx, s') -> Done(Expression.Wrap(resx), s')
+    | Done(resx, s') -> printfn "\nwrapresult: \n\n%A" resx
+                        Done(Expression.Wrap(resx), s')
 
 let rec ExprW3 x y z =
   fun s ->
@@ -294,36 +298,42 @@ let rec ExprW3 x y z =
             match z s'' with
             | Pause(pt, z', s''') -> Pause(pt, ExprW3 (co{return resx}) (co{return resy}) z', s''')
             | Error(errormsg, s''') -> Error(errormsg, s''')
-            | Done(resz, s''') -> Done(Expression.Wrap(resx, resy, resz), s''')
+            | Done(resz, s''') -> printfn "\nwrapresult: \n\n%A%A%A" resx resy resz
+                                  Done(Expression.Wrap(resx, resy, resz), s''')
 
 //PARSER
 
 let rec FactorParser() =
   co{
     do! SkipWhitespace
-    do! pause_ ParserPause
+    //do! pause_ ParserPause
     let! factor = (FactorW3 Parens (ExprParser()) Parens) .||
                   (FactorW2 AddSub (FactorParser())) .||
                   FactorW1 ReadNumeral
+    //do! PrintResult factor
     return factor
   }
 
 and TermParser() =
   co{
     do! SkipWhitespace
-    do! pause_ ParserPause
+    //do! pause_ ParserPause
     let! term = (TermW3 (FactorParser()) MultDivide (TermParser())) .||
                 (TermW1 (FactorParser()))
+    //do! PrintResult term
     return term
   }
 
 and ExprParser() =
   co{
     do! SkipWhitespace
-    do! pause_ ParserPause
+    //do! pause_ ParserPause
     let! expr = (ExprW3 (TermParser()) AddSub (ExprParser())) .||
                 (ExprW1 (TermParser()))
     do! SkipWhitespace
+    //do! PrintResult expr
+    let! st = getState
+    do! setState {st with Tree = expr}
     return expr
   }
 
@@ -335,24 +345,24 @@ let (%?) a b =
 let rec FactorEval factor =
   match factor with
   | Number(num) -> num
-  | Compound(op,factor') ->
+  | CompoundFactor(op,factor') ->
       match op with
       | Minus -> - FactorEval factor'
       | Plus -> FactorEval factor'
-  | Parenthesized(_, expr', _) -> ExprEval expr'
+  | ParenthesizedExpr(_, expr', _) -> ExprEval expr'
 
 and TermEval term =
   match term with
-  | SingleT(factor) -> FactorEval factor
-  | MultipleT(factor, op, term') ->
+  | SingleTerm(factor) -> FactorEval factor
+  | MultipleTerm(factor, op, term') ->
       match op with
       | Multiply -> (FactorEval factor) * (TermEval term')
       | Divide -> (FactorEval factor) / (TermEval term')
 
 and ExprEval expr =
   match expr with
-  | Single term -> TermEval term
-  | Multiple(term, op, expr') ->
+  | SingleExpr term -> TermEval term
+  | CompoundExpr(term, op, expr') ->
       match op with
       | Plus -> (TermEval term) % 1000000007.0 + (ExprEval expr')
       | Minus -> (TermEval term) % 1000000007.0 - (ExprEval expr')
@@ -376,14 +386,13 @@ let Explode xs =
 let rec Program (c:StateCoroutine<Expression, State>) (s:State) pauses =
   let c', s' = costep c pauses s
   match s'.Text with
-  | h::t -> printfn "Head:'%A' Tail:'%A'" h t
-            System.Console.ReadLine()
+  | h::t -> ignore <| System.Console.ReadLine()
             Program c' s' pauses
-  | [] -> printfn "Finished parsing, now to evaluate"
+  | [] -> printfn "\nResult:\n\n%A" s'.Tree
           c'
 
 let pauses = [LexerPause;ParserPause] //which kinds of pauses(or yields) to actually pause the entire coroutine at
-do ignore <| System.Console.WindowWidth <- 180
-do ignore <| System.Console.WindowHeight <- 56
-let input = {Text = Explode (System.Console.ReadLine()); Tree = None}
+do ignore <| System.Console.WindowWidth <- 130
+do ignore <| System.Console.WindowHeight <- 40
+let input = {Text = Explode (System.Console.ReadLine()); Tree = End}
 let finalexpr = Program (ExprParser()) input pauses
